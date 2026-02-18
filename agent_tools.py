@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from openai import OpenAI
@@ -23,7 +23,7 @@ context = [{"role": "system", "content": SYSTEM_PROMPT}]
 SESSION_STORE_DIR = os.path.join(tempfile.gettempdir(), "agent_tools_sessions")
 SESSION_FILE_SUFFIX = ".json"
 
-DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_MODEL = "gpt-5.2-codex"
 
 ToolHandler = Callable[..., str]
 
@@ -248,6 +248,7 @@ def _perform_request(
     prefer_json: bool = False,
     json_limit: int = 4000,
     text_limit: int = 2000,
+    verify_tls: bool = True,
 ) -> str:
     try:
         response = requests.request(
@@ -258,6 +259,12 @@ def _perform_request(
             headers=headers,
             timeout=timeout_seconds,
             allow_redirects=allow_redirects,
+            verify=verify_tls,
+        )
+    except requests.exceptions.SSLError as exc:
+        return (
+            "error: TLS certificate verification failed; ensure CA certificates are installed "
+            f"or configured correctly ({exc})"
         )
     except requests.RequestException as exc:
         return f"error: {exc}"
@@ -455,8 +462,11 @@ def safe_tool(func: ToolHandler) -> ToolHandler:
 
 @safe_tool
 def ping(host: str = "") -> str:
+    target = (host or "").strip()
+    if not target:
+        return "error: host is required"
     result = subprocess.run(
-        ["ping", "-c", "5", host],
+        ["ping", "-c", "5", target],
         text=True,
         stderr=subprocess.STDOUT,
         stdout=subprocess.PIPE,
@@ -469,8 +479,15 @@ def ping(host: str = "") -> str:
 def google_search(query: str = "", num_results: int = 3) -> str:
     api_key = os.getenv("GOOGLE_API_KEY")
     cx = os.getenv("GOOGLE_CSE_ID")
-    if not api_key or not cx:
-        return "error: GOOGLE_API_KEY and GOOGLE_CSE_ID must be set"
+    missing = []
+    if not api_key:
+        missing.append("GOOGLE_API_KEY")
+    if not cx:
+        missing.append("GOOGLE_CSE_ID")
+    if missing:
+        return f"error: missing required env vars: {', '.join(missing)}"
+    if not (query or "").strip():
+        return "error: query is required"
     num = max(1, min(int(num_results or 3), 10))
     response = requests.get(
         "https://www.googleapis.com/customsearch/v1",
@@ -497,6 +514,7 @@ def http_request(
     headers: Optional[Dict[str, str]] = None,
     body: Optional[str] = None,
     timeout: int = 10,
+    verify_tls: bool = True,
 ) -> str:
     if not url:
         return "error: url is required"
@@ -508,6 +526,8 @@ def http_request(
         timeout_seconds = _coerce_int(timeout, 10, 1, 30)
     except ValueError:
         return "error: timeout must be an integer"
+    if not isinstance(verify_tls, bool):
+        return "error: verify_tls must be a boolean"
     return _perform_request(
         verb,
         url,
@@ -518,6 +538,7 @@ def http_request(
         include_headers=15,
         include_body=verb != "HEAD",
         text_limit=2000,
+        verify_tls=verify_tls,
     )
 
 
@@ -548,7 +569,14 @@ def grafana_request(
     except ValueError:
         return "error: timeout must be an integer"
 
-    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+    normalized_path = "/" + path.lstrip("/")
+    parsed_base = urlparse(base_url)
+    base_path = (parsed_base.path or "").rstrip("/")
+    if base_path == "/api" and (
+        normalized_path == "/api" or normalized_path.startswith("/api/")
+    ):
+        normalized_path = normalized_path[4:] or "/"
+    url = f"{base_url.rstrip('/')}/{normalized_path.lstrip('/')}"
     request_headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -652,6 +680,179 @@ def mesos_frameworks(
     elif include_completed:
         sections.append("Completed frameworks: 0")
     return "\n".join(sections)
+
+
+MATTERMOST_CHANNELS = ("IRC-site", "Lab")
+
+
+@safe_tool
+def mattermost_channels_status(
+    channel: str = "",
+    limit: int = 5,
+    timeout: int = 10,
+) -> str:
+    base_url = os.getenv("MATTERMOST_API_URL")
+    api_id = os.getenv("MATTERMOST_API_ID")
+    api_token = os.getenv("MATTERMOST_API_TOKEN")
+    team_name = os.getenv("MATTERMOST_TEAM_NAME", "sarao")
+
+    missing = []
+    if not base_url:
+        missing.append("MATTERMOST_API_URL")
+    if not api_id:
+        missing.append("MATTERMOST_API_ID")
+    if not api_token:
+        missing.append("MATTERMOST_API_TOKEN")
+    if missing:
+        return f"error: missing required env vars: {', '.join(missing)}"
+
+    try:
+        limit_count = _coerce_int(limit, 5, 1, 20)
+    except ValueError:
+        return "error: limit must be an integer"
+    try:
+        timeout_seconds = _coerce_int(timeout, 10, 1, 30)
+    except ValueError:
+        return "error: timeout must be an integer"
+
+    requested = (channel or "").strip()
+    if requested:
+        selected = next(
+            (name for name in MATTERMOST_CHANNELS if name.casefold() == requested.casefold()),
+            None,
+        )
+        if not selected:
+            allowed = ", ".join(MATTERMOST_CHANNELS)
+            return f"error: channel must be one of: {allowed}"
+        target_channels = [selected]
+    else:
+        target_channels = list(MATTERMOST_CHANNELS)
+
+    mm_base = base_url.rstrip("/")
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Client-Id": api_id,
+    }
+
+    team_url = f"{mm_base}/api/v4/teams/name/{quote(team_name, safe='')}"
+    try:
+        team_response = requests.get(team_url, headers=headers, timeout=timeout_seconds)
+    except requests.RequestException as exc:
+        return f"error: Mattermost team lookup failed: {exc}"
+    if team_response.status_code >= 400:
+        return (
+            f"error: Mattermost team lookup failed: {team_response.status_code} "
+            f"{team_response.reason}"
+        )
+    try:
+        team_payload = team_response.json()
+    except ValueError:
+        return "error: Mattermost team lookup did not return JSON"
+    team_id = team_payload.get("id")
+    if not team_id:
+        return "error: Mattermost team lookup returned no team id"
+
+    lines = [
+        f"Team: {team_payload.get('display_name') or team_payload.get('name') or team_name}",
+        f"Team id: {team_id}",
+        f"Channels checked: {', '.join(target_channels)}",
+    ]
+
+    for channel_name in target_channels:
+        search_url = f"{mm_base}/api/v4/teams/{team_id}/channels/search"
+        try:
+            search_response = requests.post(
+                search_url,
+                headers=headers,
+                json={"term": channel_name},
+                timeout=timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            lines.append(f"- {channel_name}: error searching channel ({exc})")
+            continue
+        if search_response.status_code >= 400:
+            lines.append(
+                f"- {channel_name}: error searching channel "
+                f"({search_response.status_code} {search_response.reason})"
+            )
+            continue
+        try:
+            search_payload = search_response.json()
+        except ValueError:
+            lines.append(f"- {channel_name}: error parsing channel search response")
+            continue
+        if not isinstance(search_payload, list) or not search_payload:
+            lines.append(f"- {channel_name}: not found in team {team_name}")
+            continue
+
+        selected_channel = None
+        for candidate in search_payload:
+            display_name = str(candidate.get("display_name") or "")
+            internal_name = str(candidate.get("name") or "")
+            if display_name.casefold() == channel_name.casefold():
+                selected_channel = candidate
+                break
+            if internal_name.casefold() == channel_name.casefold().replace(" ", "-"):
+                selected_channel = candidate
+                break
+        if selected_channel is None:
+            selected_channel = search_payload[0]
+
+        channel_id = selected_channel.get("id")
+        if not channel_id:
+            lines.append(f"- {channel_name}: found channel without id")
+            continue
+
+        posts_url = f"{mm_base}/api/v4/channels/{channel_id}/posts"
+        try:
+            posts_response = requests.get(
+                posts_url,
+                headers=headers,
+                params={"page": "0", "per_page": str(limit_count)},
+                timeout=timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            lines.append(f"- {channel_name}: error fetching posts ({exc})")
+            continue
+        if posts_response.status_code >= 400:
+            lines.append(
+                f"- {channel_name}: error fetching posts "
+                f"({posts_response.status_code} {posts_response.reason})"
+            )
+            continue
+        try:
+            posts_payload = posts_response.json()
+        except ValueError:
+            lines.append(f"- {channel_name}: posts response was not JSON")
+            continue
+
+        order = posts_payload.get("order") or []
+        posts = posts_payload.get("posts") or {}
+        if not order:
+            lines.append(f"- {channel_name}: no recent posts")
+            continue
+
+        latest_id = order[0]
+        latest_post = posts.get(latest_id) or {}
+        latest_ts = latest_post.get("create_at")
+        if isinstance(latest_ts, (int, float)) and latest_ts > 0:
+            latest_time = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(latest_ts / 1000))
+        else:
+            latest_time = "unknown"
+        latest_message = str(latest_post.get("message") or "").replace("\n", " ").strip()
+        if len(latest_message) > 120:
+            latest_message = f"{latest_message[:117]}..."
+        latest_message = latest_message or "[empty]"
+
+        resolved_name = selected_channel.get("display_name") or selected_channel.get("name")
+        lines.append(
+            f"- {resolved_name}: {len(order)} recent posts; latest {latest_time}; "
+            f"latest message: {latest_message}"
+        )
+
+    return "\n".join(lines)
 
 
 READ_ONLY_POST_PREFIXES = (
@@ -807,55 +1008,6 @@ def elasticsearch_read(
     )
 
 
-@safe_tool
-def logtrail_request(
-    path: str = "default/json",
-    method: str = "GET",
-    query: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
-    body: Optional[str] = None,
-    timeout: int = 10,
-) -> str:
-    auth_header, auth_error = _resolve_kibana_auth_header()
-    if auth_error:
-        return auth_error
-
-    base_url = os.getenv("LOGTRAIL_API_URL", mc_service_url(5601, "/logtrail"))
-    allowed_methods = {"GET", "POST"}
-    verb = (method or "GET").upper()
-    if verb not in allowed_methods:
-        return f"error: unsupported method '{verb}', use one of {sorted(allowed_methods)}"
-
-    try:
-        timeout_seconds = _coerce_int(timeout, 10, 1, 30)
-    except ValueError:
-        return "error: timeout must be an integer"
-
-    url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
-    request_headers = {
-        "Accept": "application/json",
-        "kbn-xsrf": "true",
-    }
-    if auth_header:
-        request_headers["Authorization"] = auth_header
-    if body:
-        request_headers["Content-Type"] = "application/json"
-    if headers:
-        request_headers.update(headers)
-
-    return _perform_request(
-        verb,
-        url,
-        headers=request_headers,
-        params=query,
-        data=body,
-        timeout_seconds=timeout_seconds,
-        prefer_json=True,
-        json_limit=4000,
-        text_limit=2000,
-    )
-
-
 TOOL_SPECS = [
     ToolSpec(
         name="ping",
@@ -919,6 +1071,10 @@ TOOL_SPECS = [
                     "type": "integer",
                     "description": "Timeout in seconds (1-30).",
                 },
+                "verify_tls": {
+                    "type": "boolean",
+                    "description": "Whether to verify TLS certificates for HTTPS requests (default true).",
+                },
             },
             "required": ["url"],
         },
@@ -975,7 +1131,7 @@ TOOL_SPECS = [
                 "method": {
                     "type": "string",
                     "description": "HTTP method to use.",
-                    "enum": ["GET", "HEAD", "POST", "PUT", "DELETE"],
+                    "enum": ["GET", "HEAD", "POST"],
                 },
                 "query": {
                     "type": "object",
@@ -989,7 +1145,7 @@ TOOL_SPECS = [
                 },
                 "body": {
                     "type": "string",
-                    "description": "JSON body for POST/PUT requests.",
+                    "description": "JSON body for POST requests.",
                 },
                 "timeout": {
                     "type": "integer",
@@ -1039,44 +1195,6 @@ TOOL_SPECS = [
         handler=elasticsearch_read,
     ),
     ToolSpec(
-        name="logtrail_request",
-        description="Call the Kibana Logtrail plugin API (default /logtrail) for log views.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Logtrail API path relative to LOGTRAIL_API_URL, defaults to 'default/json'.",
-                },
-                "method": {
-                    "type": "string",
-                    "description": "HTTP method to use.",
-                    "enum": ["GET", "POST"],
-                },
-                "query": {
-                    "type": "object",
-                    "description": "Optional query string parameters.",
-                    "additionalProperties": {"type": "string"},
-                },
-                "headers": {
-                    "type": "object",
-                    "description": "Additional headers to include.",
-                    "additionalProperties": {"type": "string"},
-                },
-                "body": {
-                    "type": "string",
-                    "description": "JSON body for POST requests (e.g., search payloads).",
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Timeout in seconds (1-30).",
-                },
-            },
-            "required": [],
-        },
-        handler=logtrail_request,
-    ),
-    ToolSpec(
         name="mesos_frameworks",
         description="Fetch framework information from the Mesos master (defaults to /master/frameworks).",
         parameters={
@@ -1102,6 +1220,29 @@ TOOL_SPECS = [
             "required": [],
         },
         handler=mesos_frameworks,
+    ),
+    ToolSpec(
+        name="mattermost_channels_status",
+        description="Check recent activity in the SARAO Mattermost channels IRC-site and Lab.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "channel": {
+                    "type": "string",
+                    "description": "Optional single channel to check ('IRC-site' or 'Lab'). Defaults to both.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of recent posts to inspect per channel (1-20).",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (1-30).",
+                },
+            },
+            "required": [],
+        },
+        handler=mattermost_channels_status,
     ),
 ]
 
