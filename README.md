@@ -29,6 +29,30 @@ python -m agent_tools \
 
 The REPL prints tool and model responses prefixed with `%;`. A per-turn token report follows whenever the OpenAI backend returns usage data, and a cumulative report is shown on exit. Ctrl+C/Ctrl+D cleanly exit after saving the session context.
 
+## MCP server
+
+The same toolbelt can be exposed over the Model Context Protocol for Claude Code or other MCP clients:
+
+```bash
+python -m agent_tools.mcp_server \
+  --transport stdio \
+  --target-mc http://lab-mc.sdp.kat.ac.za
+```
+
+- `--transport` can be `stdio` (default), `sse`, or `streamable-http` (set `--host/--port` for the HTTP transports).
+- Uses the same environment variables and read-only safeguards as the REPL (`GRAFANA_API_TOKEN`, `KIBANA_API_KEY`, `MESOS_MASTER_URL`, etc.).
+
+## Clockify auto-fill MCP server
+
+Copy a previous week of Clockify entries into a target week over MCP (dry run by default):
+
+```bash
+python -m agent_tools.clockify_mcp_server --transport stdio
+```
+
+- Requires `CLOCKIFY_API_KEY`; optional `CLOCKIFY_TIMEZONE` sets the offset when timestamps lack timezone data.
+- The `generate_clockify_week` tool copies the most recent historical week (within `weeks_back`) into the target week. Pass `dry_run=false` to create entries.
+
 ## Tooling
 
 The bundled tools live in `agent_tools/tools.py` and are exposed to both LLM backends:
@@ -48,6 +72,7 @@ Schemas for the OpenAI function-calling API and Gemini Tools API are generated f
 - Kibana helpers need either `KIBANA_API_KEY` or `KIBANA_BASIC_AUTH`; `KIBANA_ALLOW_NO_AUTH=1` allows anonymous access for test stacks.
 - Optional overrides: `ELASTICSEARCH_URL`, `LOGTRAIL_API_URL`, `MESOS_MASTER_URL`.
 - `TARGET_MC` controls the default host that `config.mc_service_url()` uses when a per-service override is absent.
+- `CLOCKIFY_API_KEY` authorizes Clockify API calls; `CLOCKIFY_TIMEZONE` sets the timezone used when timestamps need a default.
 
 Unset options fall back to lab infrastructure defaults (`http://lab-mc.sdp.kat.ac.za`). All inputs are sanitized before serialization so saved sessions only include the data needed to recreate context.
 
